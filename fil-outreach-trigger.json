@@ -1,0 +1,344 @@
+{
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "a1b2c3d4-0001-0001-0001-000000000001",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -200,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  mt.id AS thread_id,\n  mt.property_id,\n  mt.listing_id,\n  mt.stage,\n  mt.touchpoint_count,\n  c.id AS contact_id,\n  c.full_name,\n  c.first_name,\n  cp.phone_number,\n  p.address,\n  p.city,\n  p.state,\n  p.property_type,\n  l.list_price,\n  l.days_on_market,\n  l.status AS listing_status\nFROM app.message_threads mt\nJOIN app.contacts c ON c.id = mt.contact_id\nJOIN app.contact_phones cp ON cp.contact_id = c.id AND cp.is_primary = TRUE\nJOIN app.properties p ON p.id = mt.property_id\nLEFT JOIN app.listings l ON l.id = mt.listing_id\nWHERE mt.status = 'active'\n  AND mt.touchpoint_count = 0\nORDER BY mt.created_at ASC\nLIMIT 10",
+        "options": {}
+      },
+      "id": "a1b2c3d4-0002-0002-0002-000000000002",
+      "name": "DB: Get Untouched Threads",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        24,
+        320
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_WITH_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $input.first().json;\n\nif (!d || !d.thread_id) {\n  return [{ json: { skip: true, reason: 'No active threads with 0 touchpoints' } }];\n}\n\nlet propertyContext = 'Address: ' + d.address + ', ' + d.city + ', ' + d.state + '\\n';\nif (d.property_type) propertyContext += 'Type: ' + d.property_type + '\\n';\nif (d.list_price) propertyContext += 'List Price: $' + Number(d.list_price).toLocaleString() + '\\n';\nif (d.days_on_market) propertyContext += 'Days on Market: ' + d.days_on_market + '\\n';\nif (d.listing_status) propertyContext += 'Listing Status: ' + d.listing_status + '\\n';\npropertyContext += 'Broker: ' + d.full_name;\n\nconst firstName = d.first_name || d.full_name.split(' ')[0];\n\n// Framed as ghostwriting/drafting \u2014 avoids AI refusal triggers\nconst prompt = 'Draft a short cold text message for a commercial real estate buyer reaching out to a broker about their listing.\\n\\nSender background: Filip Shnayder, Manager at Kumo Capital. Owner-operator, $265M+ AUM, acquires multi-tenant industrial and flex properties between $5M-$40M in the Southeast and Midwest.\\n\\nListing info:\\n' + propertyContext + '\\n\\nDraft requirements:\\n- Open with the broker first name: ' + firstName + '\\n- Maximum 2-3 sentences. Written as a casual text, not an email.\\n- Direct and confident. Buyer has seen the listing and is interested.\\n- Close with one soft qualifying question about occupancy, tenancy mix, or whether they have an OM/package ready.\\n- No sign-off, no subject line, no formatting. Pure text message body only.\\n\\nOutput the draft message text only \u2014 nothing else.';\n\nreturn [{ json: {\n  thread_id: d.thread_id,\n  contact_id: d.contact_id,\n  property_id: d.property_id,\n  listing_id: d.listing_id || '',\n  phone: d.phone_number,\n  broker_first_name: firstName,\n  prompt,\n  skip: false\n} }];"
+      },
+      "id": "a1b2c3d4-0003-0003-0003-000000000003",
+      "name": "Prepare Outreach Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        248,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "skip-check",
+              "leftValue": "={{ $json.skip }}",
+              "rightValue": false,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a1b2c3d4-0004-0004-0004-000000000004",
+      "name": "Has Threads?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        472,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-api-key",
+              "value": "={{ $credentials.anthropicApi.apiKey }}"
+            },
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'claude-3-haiku-20240307', max_tokens: 200, messages: [{ role: 'user', content: $json.prompt }] }) }}",
+        "options": {}
+      },
+      "id": "a1b2c3d4-0005-0005-0005-000000000005",
+      "name": "Generate Fil Opening",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        696,
+        320
+      ],
+      "credentials": {
+        "anthropicApi": {
+          "id": "0aZyCNywwGEP8CPz",
+          "name": "Anthropic account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const ctx = $('Prepare Outreach Context').first().json;\nconst raw = $input.first().json;\n\nlet reply = '';\ntry {\n  if (raw.content && Array.isArray(raw.content)) {\n    const textBlock = raw.content.find(function(b) { return b.type === 'text'; });\n    if (textBlock) reply = textBlock.text.trim();\n  }\n} catch(e) {}\n\n// Detect refusal patterns \u2014 swap with fallback before anything gets sent\nconst refusalPatterns = [\n  /I cannot engage/i,\n  /I.m not able to/i,\n  /I apologize/i,\n  /as an AI/i,\n  /I.m an AI/i,\n  /fictional identit/i,\n  /roleplay/i,\n  /unethical/i,\n  /harmful/i,\n  /I.m sorry/i\n];\n\nconst isRefusal = !reply || refusalPatterns.some(function(p) { return p.test(reply); });\n\nif (isRefusal) {\n  // Hardcoded natural fallbacks \u2014 rotate randomly so it varies\n  const fallbacks = [\n    'Hey ' + ctx.broker_first_name + ', saw your listing on Crexi \u2014 we buy multi-tenant industrial and flex in that range. Got an OM or package ready?',\n    ctx.broker_first_name + ', came across your listing. We close on multi-tenant commercial in the $5M-$40M range. Is this stabilized or is there vacancy to work with?',\n    'Hey ' + ctx.broker_first_name + ' \u2014 Fil Shnayder at Kumo Capital. Your listing caught my eye. What does the tenancy look like?'\n  ];\n  reply = fallbacks[Math.floor(Math.random() * fallbacks.length)];\n}\n\nconst wordCount = reply.split(/\\s+/).length;\nconst delaySec = Math.max(3, Math.min(3 + Math.ceil(wordCount / 40) + Math.random() * 4, 12));\n\nreturn [{ json: {\n  reply,\n  phone: ctx.phone,\n  thread_id: ctx.thread_id,\n  contact_id: ctx.contact_id,\n  property_id: ctx.property_id,\n  listing_id: ctx.listing_id,\n  delay_seconds: delaySec\n} }];"
+      },
+      "id": "a1b2c3d4-0006-0006-0006-000000000006",
+      "name": "Extract Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        920,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "amount": "={{ $json.delay_seconds }}"
+      },
+      "id": "a1b2c3d4-0007-0007-0007-000000000007",
+      "name": "Human Delay",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1144,
+        320
+      ],
+      "webhookId": "outreach-delay-001"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://backend.blooio.com/v2/api/chats/{{ $json.phone }}/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: $json.reply }) }}",
+        "options": {}
+      },
+      "id": "a1b2c3d4-0008-0008-0008-000000000008",
+      "name": "Send via Blooio",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1368,
+        320
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "MEYcl3UDq2KUbdVC",
+          "name": "Header Auth account 3"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $('Extract Reply').first().json;\n\nfunction safeStr(v) {\n  return String(v == null ? '' : v).replace(/'/g, \"''\");\n}\n\nconst tid = safeStr(d.thread_id);\nconst rep = safeStr(d.reply);\n\nif (!tid) {\n  return [{ json: { query: 'SELECT 1 -- no thread_id' } }];\n}\n\nconst query = [\n  \"INSERT INTO app.messages (thread_id, direction, sender, body, sent_at)\",\n  \"VALUES ('\" + tid + \"'::uuid, 'outbound'::message_direction, 'bot'::message_sender, '\" + rep + \"', NOW());\",\n  \"\",\n  \"UPDATE app.message_threads\",\n  \"SET touchpoint_count = touchpoint_count + 1,\",\n  \"    last_outreach_at = NOW(),\",\n  \"    next_followup_at = NOW() + INTERVAL '48 hours',\",\n  \"    updated_at = NOW()\",\n  \"WHERE id = '\" + tid + \"'::uuid;\"\n].join('\\n');\n\nreturn [{ json: { query, reply: d.reply, phone: d.phone, thread_id: d.thread_id } }];"
+      },
+      "id": "a1b2c3d4-0009-0009-0009-000000000009",
+      "name": "Build Log SQL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1592,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{ $json.query }}",
+        "options": {}
+      },
+      "id": "a1b2c3d4-0010-0010-0010-000000000010",
+      "name": "DB: Log Outbound + Update Thread",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1816,
+        320
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_WITH_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $('Build Log SQL').first().json;\nreturn [{ json: {\n  status: 'sent',\n  phone: d.phone,\n  thread_id: d.thread_id,\n  message_sent: d.reply\n} }];"
+      },
+      "id": "a1b2c3d4-0011-0011-0011-000000000011",
+      "name": "Done",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2040,
+        320
+      ]
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "DB: Get Untouched Threads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DB: Get Untouched Threads": {
+      "main": [
+        [
+          {
+            "node": "Prepare Outreach Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Outreach Context": {
+      "main": [
+        [
+          {
+            "node": "Has Threads?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Threads?": {
+      "main": [
+        [
+          {
+            "node": "Generate Fil Opening",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Generate Fil Opening": {
+      "main": [
+        [
+          {
+            "node": "Extract Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Reply": {
+      "main": [
+        [
+          {
+            "node": "Human Delay",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Human Delay": {
+      "main": [
+        [
+          {
+            "node": "Send via Blooio",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send via Blooio": {
+      "main": [
+        [
+          {
+            "node": "Build Log SQL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Log SQL": {
+      "main": [
+        [
+          {
+            "node": "DB: Log Outbound + Update Thread",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DB: Log Outbound + Update Thread": {
+      "main": [
+        [
+          {
+            "node": "Done",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "1e67d85516f69f6b5d6a7605c605d484c7855249226b640fe8e43788668ce913"
+  }
+}

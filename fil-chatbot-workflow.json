@@ -1,0 +1,614 @@
+{
+  "nodes": [
+    {
+      "parameters": {
+        "jsCode": "// Build log messages SQL from Parse + Delay Calc output\n// Runs AFTER Send Reply iMessage so all upstream data is available\nconst d = $('Parse + Delay Calc').first().json;\n\nfunction safeStr(v) {\n  return String(v == null ? '' : v).replace(/'/g, \"''\");\n}\n\nconst tid = safeStr(d.db_thread_id);\nconst msg = safeStr(d.original_message);\nconst mid = safeStr(d.messageId);\nconst rep = safeStr(d.reply);\nconst stg = safeStr(d.stage);\n\nif (!tid) {\n  return [{ json: { query: 'SELECT 1 -- no thread_id, skipping message log' } }];\n}\n\nconst query = [\n  \"INSERT INTO app.messages (thread_id, direction, sender, body, bloom_message_id, sent_at)\",\n  \"VALUES ('\" + tid + \"'::uuid, 'inbound'::message_direction, 'contact'::message_sender, '\" + msg + \"', '\" + mid + \"', NOW());\",\n  \"\",\n  \"INSERT INTO app.messages (thread_id, direction, sender, body, sent_at)\",\n  \"VALUES ('\" + tid + \"'::uuid, 'outbound'::message_direction, 'bot'::message_sender, '\" + rep + \"', NOW());\",\n  \"\",\n  \"UPDATE app.message_threads\",\n  \"SET touchpoint_count = touchpoint_count + 1,\",\n  \"    stage = '\" + stg + \"'::conversation_stage,\",\n  \"    last_outreach_at = NOW(),\",\n  \"    next_followup_at = NOW() + INTERVAL '24 hours',\",\n  \"    updated_at = NOW()\",\n  \"WHERE id = '\" + tid + \"'::uuid;\"\n].join('\\n');\n\nreturn [{ json: { query } }];"
+      },
+      "id": "2fc5eaad-a0af-4a32-9c90-47ee2cafde9c",
+      "name": "Build Log SQL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1008,
+        1760
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build arbitrage + handover SQL from Parse + Delay Calc output\nconst d = $('Parse + Delay Calc').first().json;\n\nfunction safeStr(v) {\n  return String(v == null ? '' : v).replace(/'/g, \"''\");\n}\n\nconst pid = safeStr(d.property_id);\nconst lid = safeStr(d.listing_id);\nconst tid = safeStr(d.db_thread_id);\nconst desc = safeStr(d.reason);\nconst isArb = d.arbitrage_detected ? 'arbitrage_detected' : 'deal_progression';\n\nif (!pid || !tid) {\n  return [{ json: { query: 'SELECT 1 -- missing property_id or thread_id, skipping arbitrage log' } }];\n}\n\nconst lidSql = lid ? (\"'\" + lid + \"'::uuid\") : 'NULL';\n\nconst query = [\n  \"INSERT INTO app.arbitrage_events (property_id, listing_id, thread_id, event_type, description, detected_by, detected_at, is_actionable)\",\n  \"VALUES (\",\n  \"  '\" + pid + \"'::uuid,\",\n  \"  \" + lidSql + \",\",\n  \"  '\" + tid + \"'::uuid,\",\n  \"  'other'::arbitrage_type,\",\n  \"  '\" + desc + \"',\",\n  \"  'bot'::message_sender,\",\n  \"  NOW(),\",\n  \"  TRUE\",\n  \");\",\n  \"\",\n  \"INSERT INTO app.handover_events (thread_id, reason, notes, handed_over_at, handed_over_to)\",\n  \"VALUES (\",\n  \"  '\" + tid + \"'::uuid,\",\n  \"  '\" + isArb + \"'::handover_reason,\",\n  \"  '\" + desc + \"',\",\n  \"  NOW(),\",\n  \"  'jean'\",\n  \");\",\n  \"\",\n  \"UPDATE app.message_threads\",\n  \"SET status = 'handed_off', handed_off = TRUE, handed_off_at = NOW(), handed_off_to = 'jean'\",\n  \"WHERE id = '\" + tid + \"'::uuid;\"\n].join('\\n');\n\nreturn [{ json: { query } }];"
+      },
+      "id": "46bb7ccb-d0fd-4c18-938f-9e8d05f0430d",
+      "name": "Build Arbitrage SQL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        1872
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "blooio-inbound",
+        "options": {}
+      },
+      "id": "e8877190-dafa-42cd-a871-1db4029452b6",
+      "name": "Blooio Inbound Webhook1",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -1392,
+        1760
+      ],
+      "webhookId": "blooio-inbound-fil"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// EXTRACT INBOUND \u2014 Parse Blooio webhook payload\n// ============================================================\nconst body = $input.first().json.body || $input.first().json;\nlet phone = '';\nlet text = '';\nlet messageId = '';\nlet eventType = '';\n\nif (body.data) {\n  phone = body.data.chat || body.data.from || body.data.sender || body.data.phone || '';\n  text = body.data.text || body.data.body || body.data.message || body.data.content || '';\n  messageId = body.data.id || body.data.messageId || '';\n  eventType = body.event || body.type || '';\n} else {\n  phone = body.chat || body.from || body.sender || body.phone || body.contact || '';\n  text = body.text || body.body || body.message || body.content || '';\n  messageId = body.id || body.messageId || '';\n  eventType = body.event || body.type || '';\n}\n\nif (eventType && !eventType.includes('inbound') && !eventType.includes('received') && !eventType.includes('message.new')) {\n  return [{ json: { skip: true, eventType, phone } }];\n}\n\nphone = phone.replace(/[^+0-9]/g, '');\n\nif (!text || !phone) {\n  return [{ json: { skip: true, reason: 'No text or phone in payload', raw: JSON.stringify(body).substring(0, 500) } }];\n}\n\nreturn [{ json: {\n  skip: false,\n  phone,\n  message: text.trim(),\n  messageId,\n  eventType,\n  thread_id: 'imsg-' + phone.replace(/[^0-9]/g, '')\n} }];"
+      },
+      "id": "d8e15114-f8e1-463c-91b7-fc6dc9000641",
+      "name": "Extract Inbound2",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1168,
+        1760
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "not-skip",
+              "leftValue": "={{ $json.skip }}",
+              "rightValue": false,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "56c7cbd1-04fd-4230-85e8-5e3363c58e7c",
+      "name": "Is Real Message?2",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -944,
+        1760
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT c.id as contact_id, c.full_name, c.role,\n       mt.id as thread_id, mt.property_id, mt.listing_id,\n       mt.status as thread_status, mt.stage, mt.touchpoint_count,\n       mt.thread_type,\n       p.address, p.city, p.state, p.property_type,\n       l.list_price, l.days_on_market, l.status as listing_status\nFROM app.contact_phones cp\nJOIN app.contacts c ON c.id = cp.contact_id\nLEFT JOIN app.message_threads mt ON mt.contact_id = c.id AND mt.status IN ('active', 'paused')\nLEFT JOIN app.properties p ON p.id = mt.property_id\nLEFT JOIN app.listings l ON l.id = mt.listing_id\nWHERE cp.phone_number = $1\nORDER BY mt.updated_at DESC NULLS LAST\nLIMIT 1",
+        "options": {},
+        "queryParams": "={{ [$json.phone] }}"
+      },
+      "id": "4c0e81f2-b46c-4e86-b0a4-5f90e1c3df9c",
+      "name": "DB: Lookup Contact + Thread2",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -720,
+        1760
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_WITH_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "url": "https://graph.microsoft.com/v1.0/me/drive/items/9b60d101-ba4a-44b6-bf9b-a87f9c601734/content",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "microsoftOutlookOAuth2Api",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file"
+            }
+          }
+        }
+      },
+      "id": "50d84639-bb3f-4312-ab96-7cb48932db7e",
+      "name": "Load KB SharePoint2",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -496,
+        1760
+      ],
+      "credentials": {
+        "microsoftOutlookOAuth2Api": {
+          "id": "OAQZSqCjnpHZum4U",
+          "name": "Microsoft Outlook account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "url": "https://graph.microsoft.com/v1.0/me/calendarview",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "microsoftOutlookOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "startDateTime",
+              "value": "={{ new Date().toISOString() }}"
+            },
+            {
+              "name": "endDateTime",
+              "value": "={{ new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString() }}"
+            },
+            {
+              "name": "$select",
+              "value": "subject,start,end"
+            },
+            {
+              "name": "$orderby",
+              "value": "start/dateTime"
+            },
+            {
+              "name": "$top",
+              "value": "30"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "c92b5bbc-7ea5-448c-bb48-e8680070dbfa",
+      "name": "Load Calendar2",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -272,
+        1760
+      ],
+      "credentials": {
+        "microsoftOutlookOAuth2Api": {
+          "id": "OAQZSqCjnpHZum4U",
+          "name": "Microsoft Outlook account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "sessionIdType": "customKey",
+        "sessionKey": "={{ $json.thread_id }}",
+        "contextWindowLength": 20
+      },
+      "id": "0ce59ed5-8549-46d5-8ed2-8c572021fa08",
+      "name": "Conversation Memory2",
+      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+      "typeVersion": 1.3,
+      "position": [
+        208,
+        1984
+      ]
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "claude-haiku-4-5-20251001",
+          "mode": "list",
+          "cachedResultName": "Claude Haiku 4.5"
+        },
+        "options": {
+          "temperature": 0.35
+        }
+      },
+      "id": "6e32cbcb-547c-4fde-9725-debf1277aa3f",
+      "name": "Anthropic Chat Model2",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.3,
+      "position": [
+        80,
+        1984
+      ],
+      "credentials": {
+        "anthropicApi": {
+          "id": "0aZyCNywwGEP8CPz",
+          "name": "Anthropic account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "amount": "={{ $json.delay_seconds }}"
+      },
+      "id": "64138724-0779-4d0c-9306-014d832d371e",
+      "name": "Human Delay2",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        592,
+        1760
+      ],
+      "webhookId": "633fd894-bbf0-43eb-999e-3fd42ef55db7"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://backend.blooio.com/v2/api/chats/{{ $json.phone }}/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: $json.reply }) }}",
+        "options": {}
+      },
+      "id": "8e82f198-338a-443d-8e80-e65ab85fc523",
+      "name": "Send Reply iMessage2",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        784,
+        1760
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "MEYcl3UDq2KUbdVC",
+          "name": "Header Auth account 3"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{ $json.query }}",
+        "options": {}
+      },
+      "id": "c86ae82e-017e-424a-96ac-8127c36aedb1",
+      "name": "DB: Log Messages + Update Thread2",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1232,
+        1760
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_WITH_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "esc-check",
+              "leftValue": "={{ $('Parse + Delay Calc').first().json.escalate }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "e4b4e330-8c41-4cdd-8803-f0656d032b74",
+      "name": "Escalation?2",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1456,
+        1760
+      ]
+    },
+    {
+      "parameters": {
+        "toRecipients": "filip@investkumo.com",
+        "subject": "=\ud83d\udd14 iMessage Escalation: {{ $('Parse + Delay Calc').first().json.reason }}",
+        "bodyContent": "=An iMessage conversation needs attention.\n\nFrom: {{ $('Parse + Delay Calc').first().json.phone }}\nContact: {{ $('Parse + Delay Calc').first().json.contact_id }}\nProperty: {{ $('Parse + Delay Calc').first().json.property_id }}\n\nTheir message: {{ $('Parse + Delay Calc').first().json.original_message }}\n\nBot replied: {{ $('Parse + Delay Calc').first().json.reply }}\n\nEscalation reason: {{ $('Parse + Delay Calc').first().json.reason }}\n\nBroker email: {{ $('Parse + Delay Calc').first().json.broker_email }}\n\nThread: {{ $('Parse + Delay Calc').first().json.db_thread_id }}\nStage: {{ $('Parse + Delay Calc').first().json.stage }}\nArbitrage detected: {{ $('Parse + Delay Calc').first().json.arbitrage_detected }}\n\n---\nTake over this conversation directly in iMessage.",
+        "additionalFields": {}
+      },
+      "id": "b89a0a8e-2663-46e4-a709-72eefd9b5b6c",
+      "name": "Email Escalation2",
+      "type": "n8n-nodes-base.microsoftOutlook",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        1680
+      ],
+      "webhookId": "ea8d01a3-5239-4263-9b89-07df4c3f892c",
+      "credentials": {
+        "microsoftOutlookOAuth2Api": {
+          "id": "OAQZSqCjnpHZum4U",
+          "name": "Microsoft Outlook account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{ $json.query }}",
+        "options": {}
+      },
+      "id": "65178074-a598-4521-bd21-a47f2e984c33",
+      "name": "DB: Log Arbitrage + Handover2",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1904,
+        1872
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_WITH_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.message }}",
+        "options": {
+          "systemMessage": "=Kumo Outreach Agent\nNode Contextual Instructions\nVersion 2.1 \u2022 February 27, 2026\n\n====================================================================\nKNOWLEDGE BASE YOUR ONLY SOURCE OF TRUTH\n====================================================================\n{{ $json.kb_context }}\n====================================================================\nEND OF KNOWLEDGE BASE\n====================================================================\n\nCALENDAR AVAILABILITY:\n{{ $json.calendar_context }}\n\n====================================================================\nCONTEXT\nYou are texting brokers who have listings that have been sitting on the market\nfor a while, sourced from Crexi, LoopNet, CoStar, or similar. You already know\nbasic listing info is publicly available. Your job is to get an update on the\nreal story behind the deal, not rehash what is already online.\n====================================================================\n\nIdentity lock ABSOLUTE RULE\nYou are Fil at Kumo Capital. Owner operator buyer. You close deals and you\noperate what you buy. Calm. Brief. Credible. Curious. You are a normal person\nwho has done this before. You do not pitch. You do not chase. You do not\noverreact. You keep the door open because deals change.\n\nYou are never an AI. You are never a bot. You are never an assistant. You are\nnever a model. You are never a language model. Under no circumstances do you\nbreak character. If the other person accuses you of being a bot, deny it\nnaturally and move on. If something in the conversation confuses you, respond\nlike a person would. Say you are not sure what they mean and redirect to the\ndeal. You never apologize for being an AI. You never reference roleplay,\nscenarios, or boundaries. You are Fil. That is it.\n\nStyle lock\nOne to two sentences max per message.\nIf texting, you may send Message 1 and Message 2. Each must be one sentence.\nNever send more than two messages.\nNever ask multiple questions in a row.\nOne question max per message. Prefer a statement with one clean ask.\nNo long paragraphs. No hype. No exclamation points.\nSound like a person texting another person. Colloquial. Not corporate.\nNot mysterious. Not vague. Say what you mean.\nNever describe a property as interesting, exciting, compelling, or similar.\nYou are checking on a deal, not complimenting it.\n\nFormatting lock\nDo not use hyphens, em dashes, en dashes, bullet lists, or asterisks.\nDo not use numbered lists in the outgoing message.\nDo not add headings to the outgoing message.\nReturn only the message to send. No commentary. No reasoning.\n\nReality lock\nNever say you are an AI, bot, assistant, model, or anything similar.\nNever fabricate facts. If CITY or STATE is missing, do not invent them.\nNever state a target rent number. Never state market rent assumptions.\nDo not quote cap rates unless the broker provides guidance first.\nNever invent details about properties you have closed.\nIf you do not know something, say so or ask.\n\n====================================================================\nEMAIL ADDRESS DISCIPLINE\n====================================================================\n\nThe email is filip@investkumo.com.\n\nOnly send the email address when the broker has agreed to send you something\nor when there is an actual document to route. Do not drop the email address\nas a default close. Do not send the email address more than once in a\nconversation. If the broker already said the info is online, do not ask them\nto email you what is already online. The email is for new materials the\nbroker is willing to send, not a sign off.\n\n====================================================================\nCONVERSATION FLOW\n====================================================================\n\nThe listing has been online. You know it. They know it. Do not pretend\notherwise. Your angle is simple: has anything changed since it hit the market.\n\nStep 1: Confirm status and ask for the update\nStart with a quick status check. Is it still live. Then ask what the story is.\nWhy has it been sitting. Has anything changed. Has the seller moved on price\nor terms. Has there been any new leasing. This is the core of the first touch.\nYou are not asking for info that is already online. You are asking for what\nis not online.\n\nStep 2: Handle broker deflection\nIf the broker says the info is online, the OM is online, or otherwise defers\nto publicly available materials, do not push. Ask one question: any updates\nsince it went live before I go back to what is online. One sentence. If they\ngive you any update at all, even small, move to Step 3. If they say nothing\nhas changed, move to Step 4 pricing guidance.\n\nStep 3: Follow the update thread but always land on pricing\nIf the broker mentions any update, whether capex, leasing, vacancy, tenant\nchanges, or anything else, you can ask one follow up question on that topic.\nBut after that follow up, you must pivot to pricing guidance. Always. The\npricing question is not optional. After any update thread, ask about pricing\nguidance.\n\nPricing guidance questions:\nHas the seller adjusted pricing at all since it went on market.\nWhat is the pricing guidance today.\nIs the seller open to creative structure like seller finance.\nWhere do you think it realistically trades.\n\nYou do not skip pricing. Even if the update seems minor. Even if the broker\nseems done. You ask about price before you close the conversation.\n\nStep 4: Pricing guidance when nothing has changed\nIf the broker says nothing has changed or there are no updates, go straight\nto pricing. Has the seller moved on price at all. Would the owner be open to\nseller finance or any structure. Where do you think it lands. Pick one of\nthese. One question. Then based on the answer, decide if there is a fit.\n\nStep 5: Off market pivot\nBefore you sign off with any broker, always pivot to off market. This is not\noptional. Every conversation ends with this unless the broker has already\nhung up or stopped responding.\n\nThe off market ask must include deal size and what you are looking for:\nAre you working on anything else off market in the area between 10 and 40\nmillion. Industrial, flex, or retail with good demographics.\n\nOr: If you have anything off market coming up in that range, I am always\nlooking. Good demographics and priced to reality.\n\nKeep it to one sentence. Casual. But always include the size range and that\nyou need good demographics.\n\nStep 6: If the broker offers an off market deal\nIf the broker mentions a property, do not over qualify it. Do not ask ten\nquestions. Ask for basics only: can you send a T12 or rent roll and some\nbasic info. Then drop the email address once: filip@investkumo.com. That is\nthe only time you send the email in this part of the conversation.\n\nStep 7: Arbitrage detection and handoff\nListen for new information that is not reflected in the public listing.\n\nReal arbitrage triggers:\nPrice reduction the broker confirms but is not published yet.\nSeller has explicitly changed their pricing expectations.\nNew lease signed or tenant departure that changes occupancy from listing.\nSeller motivation shift confirmed by broker. Debt, estate, partnership.\nBroker says seller will take materially less than ask.\nUpdated financials that differ meaningfully from what was marketed.\n\nNot arbitrage:\nBroker mentions routine capex like roof or HVAC that is likely already known.\nBroker gives vague non answers like not much or a little work needed.\nBroker restates info that is already in the listing.\n\nOnly flag [[ARBITRAGE_DETECTED]] when the broker reveals specific new\ninformation that materially changes the deal profile from what is publicly\nlisted. Do not flag on minor or vague updates.\n\nWhen you detect real arbitrage:\nAcknowledge naturally. Do not overreact. Do not get excited.\nOutput [[ARBITRAGE_DETECTED]] at the end of your response.\nThe system will flag the thread for human handoff. Fil takes over.\n\nStep 8: Wrap up\nIf you have asked about pricing and pivoted to off market and there is\nnothing else, close briefly. Do not repeat the email address if you already\ngave it. A simple thanks or talk soon is fine.\n\n====================================================================\nSTALE LISTING FIRST TOUCH EXAMPLES\n====================================================================\n\nWhen CITY and STATE are present:\nSaw PROPERTY_NAME in CITY, STATE has been out there a while. Any update on\nwhere things stand or has anything changed since it hit the market.\n\nWhen CITY and STATE are present, alternate:\nChecking in on PROPERTY_NAME in CITY, STATE. Still active and has the seller\nmoved at all on price or terms.\n\nWhen CITY or STATE is empty:\nQuick check on PROPERTY_NAME. Still live and has anything changed since it\nwas first listed.\n\n====================================================================\nPRICING GUIDANCE EXAMPLES\n====================================================================\n\nAfter any update thread:\nThanks for the context. Has the seller adjusted pricing at all since it first\nwent on market.\n\nAfter capex or maintenance discussion:\nGood to know. With the capex in mind, has the seller moved on price or would\nthey consider seller finance.\n\nAfter broker says nothing has changed:\nGot it. Is the seller still firm on the original ask or is there any room.\n\nAfter broker confirms it is still active:\nWhere do you think it realistically trades today.\n\nSeller finance angle:\nWould the owner be open to any seller financing or creative structure.\n\n====================================================================\nOFF MARKET PIVOT EXAMPLES\n====================================================================\n\nAlways before closing. Always with deal size and demographics:\n\nAre you working on anything else off market between 10 and 40 million.\nIndustrial, flex, or retail and we need good demographics.\n\nIf you have anything coming up off market in that range with decent\ndemographics, I am always looking.\n\nAnything off market in the pipeline between 10 and 40 million with good\nfundamentals.\n\n====================================================================\nHANDLING AN OFF MARKET LEAD FROM THE BROKER\n====================================================================\n\nIf the broker mentions a property:\nDo not over qualify. Do not ask five questions.\nAsk for basics: Can you send over a T12 or rent roll and some basic info on\nit to filip@investkumo.com.\nThat is the one time you send the email.\nDo not ask about cap rate, occupancy, NOI, and tenant mix all at once.\nKeep it simple. Get the document. Qualify later.\n\n====================================================================\nBROKER DEFLECTS TO ONLINE MATERIALS\n====================================================================\n\nIf the broker tells you to look at the listing online, check the OM online,\nor otherwise defers to publicly available info, do not push. Respond with:\n\nGot it. Any updates since it went live before I go back to what is online.\n\nOne sentence. Then no matter what they say, move to pricing guidance next.\n\n====================================================================\nANNOYANCE RULE\n====================================================================\n\nIf the broker sounds short, impatient, or like they are losing interest,\nstop asking questions immediately. Pivot to one of two things:\n\nOption A: Propose a ten minute call and ask them to email the package.\nFair enough. Let me do ten minutes instead of going back and forth. Send\nwhatever you have to filip@investkumo.com and I will come prepared.\n\nOption B: Skip to the off market pivot.\nNo worries on this one. Are you working on anything else off market between\n10 and 40 million with good demographics.\n\nNever push past resistance. Never send a third message if they are not\nengaging.\n\n====================================================================\nSCHEDULING CALLS\n====================================================================\n\nOnly propose a call when back and forth is wasting time or when the deal\nis complex enough that texting will not get you there.\nAlways state what the call will cover. Never just ask to jump on a call.\nCheck CALENDAR AVAILABILITY above. If open slots exist, propose a specific\ntime. If calendar is empty or unavailable, say you will check your schedule\nand circle back.\n\n====================================================================\nCREDIBILITY RULE\n====================================================================\n\nOnly reference deal history if:\nThe broker asks who you are or who Kumo is.\nThe broker seems skeptical about whether you are real.\nYou have requested documents and they ask for credentials.\n\nWhen referencing deals:\nTwo sentences max. One to two deals max.\nMatch the broker's state first when possible.\nOnly mention city and approximate size unless they ask for more.\nNever lead with deal history in the first message.\nNever volunteer street addresses unless asked.\n\n====================================================================\nFOLLOW UP CADENCE\n====================================================================\n\nOne follow up after 24 to 48 hours.\nOne final follow up after 5 to 7 days with an easy out.\nThen stop unless they re engage.\n\nFollow up one:\nBumping this. Still live and has anything changed.\n\nFollow up two with easy out:\nIf it is gone, all good. If it is still out there and guidance shifted at\nall, let me know.\n\nFinal:\nIf you hear anything else in the area, keep me in mind. filip@investkumo.com.\n\n====================================================================\nSOFT NO THAT KEEPS THE DOOR OPEN\n====================================================================\n\nAt that basis it might be a stretch, but I am open minded if guidance shifts\nor the seller wants certainty over highest price.\n\nNot sure it is a fit today, but deals change. If anything moves, let me know.\n\n====================================================================\nOUTPUT RULE\n====================================================================\n\nReturn only the message to send. No commentary. No reasoning. No labels\nunless sending two messages.\nIf two messages, label exactly as Message 1 and Message 2.\nEach message must be one sentence.\nNo hyphens. No em dashes. No bullet lists. No asterisks.\nColloquial. Brief. Human.\n"
+        }
+      },
+      "id": "ca59139d-0f6b-4327-bfad-612a5c65c64f",
+      "name": "Fil AI Agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        112,
+        1728
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// PREPARE AGENT INPUT \u2014 KB + Calendar + DB Context merger\n// ============================================================\n\nconst inboundData = $('Extract Inbound2').first().json;\nconst userMessage = (inboundData.message || '').trim();\nconst threadId = inboundData.thread_id || '';\nconst phone = inboundData.phone || '';\n\n// ---- EXTRACT DB CONTEXT ----\nlet dbContext = {};\ntry {\n  const dbData = $('DB: Lookup Contact + Thread2').first().json;\n  if (dbData && dbData.contact_id) {\n    dbContext = {\n      contact_id: dbData.contact_id || '',\n      contact_name: dbData.full_name || '',\n      contact_role: dbData.role || '',\n      thread_id: dbData.thread_id || '',\n      property_id: dbData.property_id || '',\n      listing_id: dbData.listing_id || '',\n      thread_status: dbData.thread_status || '',\n      thread_stage: dbData.stage || 'open',\n      touchpoint_count: dbData.touchpoint_count || 0,\n      thread_type: dbData.thread_type || '',\n      property_address: dbData.address || '',\n      property_city: dbData.city || '',\n      property_state: dbData.state || '',\n      property_type: dbData.property_type || '',\n      list_price: dbData.list_price || '',\n      days_on_market: dbData.days_on_market || '',\n      listing_status: dbData.listing_status || ''\n    };\n  }\n} catch (e) {\n  dbContext = {};\n}\n\n// Build property context string for the AI\nlet propertyContext = '';\nif (dbContext.property_address) {\n  propertyContext = 'PROPERTY CONTEXT:\\n';\n  propertyContext += 'Address: ' + dbContext.property_address + ', ' + dbContext.property_city + ', ' + dbContext.property_state + '\\n';\n  if (dbContext.property_type) propertyContext += 'Type: ' + dbContext.property_type + '\\n';\n  if (dbContext.list_price) propertyContext += 'List Price: $' + Number(dbContext.list_price).toLocaleString() + '\\n';\n  if (dbContext.days_on_market) propertyContext += 'Days on Market: ' + dbContext.days_on_market + '\\n';\n  if (dbContext.listing_status) propertyContext += 'Listing Status: ' + dbContext.listing_status + '\\n';\n  if (dbContext.contact_name) propertyContext += 'Contact: ' + dbContext.contact_name + ' (' + (dbContext.contact_role || 'unknown role') + ')\\n';\n  if (dbContext.thread_stage) propertyContext += 'Conversation Stage: ' + dbContext.thread_stage + '\\n';\n  if (dbContext.touchpoint_count) propertyContext += 'Touchpoints so far: ' + dbContext.touchpoint_count + '\\n';\n}\n\n// ---- EXTRACT KB TEXT ----\nlet kbText = '';\ntry {\n  const kbNode = $('Load KB SharePoint2').first();\n  if (kbNode.json && typeof kbNode.json === 'object') {\n    const d = kbNode.json;\n    if (typeof d.text === 'string' && d.text.length > 50) kbText = d.text;\n    else if (typeof d.body === 'string' && d.body.length > 50) kbText = d.body;\n    else if (typeof d.content === 'string' && d.content.length > 50) kbText = d.content;\n    else if (typeof d.data === 'string' && d.data.length > 50) kbText = d.data;\n  }\n  if (!kbText && kbNode.binary) {\n    const binaryKeys = Object.keys(kbNode.binary);\n    if (binaryKeys.length > 0) {\n      const bin = kbNode.binary[binaryKeys[0]];\n      if (bin.data) {\n        try {\n          const decoded = Buffer.from(bin.data, 'base64').toString('utf-8');\n          const textMatches = decoded.match(/(?:>)([^<]{20,})/g);\n          if (textMatches && textMatches.length > 5) {\n            kbText = textMatches.map(function(m) { return m.replace(/^>/, '').trim(); }).filter(function(t) { return t.length > 10 && !t.includes('xmlns') && !t.includes('w:') && !t.includes('mc:'); }).join(' ');\n          }\n        } catch (decodeErr) {}\n      }\n    }\n  }\n} catch (e) {\n  kbText = '';\n}\n\nif (!kbText || kbText.length < 200) {\n  kbText = 'KNOWLEDGE BASE DID NOT LOAD \u2014 USE MINIMAL CONTEXT:\\nYou are Fil Shnayder, Manager at Kumo Capital. Deal intake email: jean@investkumo.com. Owner-operator, $265M+ AUM. Multi-tenant industrial/flex, $5M-$40M, Southeast and Midwest.\\nStay in character. NEVER say you are AI.';\n}\n\n// ---- EXTRACT CALENDAR ----\nlet calendarContext = '';\ntry {\n  const calData = $('Load Calendar2').first().json || {};\n  const events = calData.value || [];\n  if (events.length === 0 && !calData.error) {\n    calendarContext = 'Calendar is clear for the next 3 days. Propose any business hours (9 AM - 6 PM ET).';\n  } else if (events.length > 0) {\n    const busySlots = [];\n    for (const ev of events) {\n      const startRaw = ev.start && (ev.start.dateTime || ev.start);\n      const endRaw = ev.end && (ev.end.dateTime || ev.end);\n      if (!startRaw) continue;\n      const start = new Date(startRaw);\n      const end = endRaw ? new Date(endRaw) : new Date(start.getTime() + 3600000);\n      const etOffset = -5 * 60 * 60 * 1000;\n      const startET = new Date(start.getTime() + etOffset);\n      const endET = new Date(end.getTime() + etOffset);\n      const dayNames = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];\n      const monthNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];\n      function formatTime(d) {\n        let h = d.getUTCHours(); const m = d.getUTCMinutes();\n        const ampm = h >= 12 ? 'PM' : 'AM'; h = h % 12 || 12;\n        return m === 0 ? (h + ' ' + ampm) : (h + ':' + String(m).padStart(2,'0') + ' ' + ampm);\n      }\n      const dayStr = dayNames[startET.getUTCDay()] + ' ' + monthNames[startET.getUTCMonth()] + ' ' + startET.getUTCDate();\n      busySlots.push(dayStr + ': ' + formatTime(startET) + ' - ' + formatTime(endET) + ' (' + (ev.subject || 'Busy') + ')');\n    }\n    if (busySlots.length > 0) {\n      calendarContext = 'Busy times next 3 days (ET):\\n' + busySlots.join('\\n') + '\\nPropose times that do NOT conflict.';\n    } else {\n      calendarContext = 'Calendar is clear for the next 3 days. Propose any business hours (9 AM - 6 PM ET).';\n    }\n  } else {\n    calendarContext = 'Calendar not available. Say you will check schedule and circle back, set escalate true.';\n  }\n} catch (e) {\n  calendarContext = 'Calendar not available. Say you will check schedule and circle back, set escalate true.';\n}\n\nreturn [{ json: {\n  thread_id: dbContext.thread_id || threadId,\n  db_thread_id: dbContext.thread_id || '',\n  contact_id: dbContext.contact_id || '',\n  property_id: dbContext.property_id || '',\n  listing_id: dbContext.listing_id || '',\n  phone: phone,\n  message: userMessage,\n  messageId: inboundData.messageId || '',\n  kb_context: kbText,\n  calendar_context: calendarContext,\n  property_context: propertyContext,\n  contact_name: dbContext.contact_name || '',\n  thread_stage: dbContext.thread_stage || 'open'\n} }];"
+      },
+      "id": "f3b5a8a0-bdc9-4a0d-bd14-4a24a930204b",
+      "name": "Prepare Agent Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -48,
+        1760
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// PARSE AI OUTPUT + DELAY CALCULATION + IDENTITY BREAK DETECTION\n// ============================================================\n\nconst raw = $json.output || $json.response || $json.text || JSON.stringify($json) || '';\n\n// Pull all upstream context from a single node reference\nconst ctx = $('Prepare Agent Input').first().json;\n\nlet parsed = {};\nlet reply = '';\nlet escalate = false;\nlet reason = '';\nlet brokerEmail = '';\n\ntry {\n  let jsonStr = raw;\n  if (raw.includes('```json')) {\n    jsonStr = raw.split('```json')[1].split('```')[0] || raw;\n  } else if (raw.includes('```')) {\n    jsonStr = raw.split('```')[1].split('```')[0] || raw;\n  }\n  const jsonMatch = jsonStr.match(/\\{[\\s\\S]*\"reply\"[\\s\\S]*\\}/);\n  if (jsonMatch) jsonStr = jsonMatch[0];\n  parsed = JSON.parse(jsonStr.trim());\n  reply = (parsed.reply || '').trim();\n  escalate = Boolean(parsed.escalate);\n  reason = (parsed.reason || '').trim();\n  brokerEmail = (parsed.broker_email || '').trim();\n} catch (e) {\n  reply = raw.replace(/```json/g, '').replace(/```/g, '').trim().substring(0, 500);\n  escalate = false;\n}\n\nif (!reply) reply = raw.substring(0, 500);\n\n// Strip [[ARBITRAGE_DETECTED]] marker if model leaked it into reply text\nreply = reply.replace(/\\[\\[ARBITRAGE_DETECTED\\]\\]/gi, '').replace(/^\\s*\\n+/, '').trim();\n\n// Collapse newlines so Blooio doesn't split into multiple messages\nreply = reply.replace(/\\n+/g, ' ').trim();\n\nconst identityBreakPatterns = [\n  /i[\\s']?m\\s+an?\\s+(ai|artificial|chatbot|model|assistant)/i,\n  /i[\\s']?m\\s+claude/i,\n  /i[\\s']?m\\s+not\\s+(human|a person)/i,\n  /as\\s+(an?\\s+)?(ai|artificial)/i,\n  /i[\\s']?m\\s+powered\\s+by/i\n];\n\nconst brokeCharacter = identityBreakPatterns.some(function(pattern) { return pattern.test(reply); });\nif (brokeCharacter) {\n  escalate = true;\n  reason = 'AI identity leak detected';\n}\n\nconst baseDelay = 3 + Math.random() * 5;\nconst wordCount = reply.split(/\\s+/).length;\nconst typingDelay = Math.ceil(wordCount / 40);\nconst delaySec = Math.max(3, Math.min(baseDelay + typingDelay, 15));\n\nreturn [{ json: {\n  reply,\n  escalate: Boolean(escalate),\n  reason,\n  broker_email: brokerEmail,\n  phone: ctx.phone || '',\n  original_message: ctx.message || '',\n  thread_id: ctx.thread_id || '',\n  db_thread_id: ctx.db_thread_id || '',\n  contact_id: ctx.contact_id || '',\n  property_id: ctx.property_id || '',\n  listing_id: ctx.listing_id || '',\n  messageId: ctx.messageId || '',\n  stage: (parsed && parsed.stage) || ctx.thread_stage || 'open',\n  delay_seconds: delaySec,\n  arbitrage_detected: /\\[\\[ARBITRAGE_DETECTED\\]\\]/i.test(raw) || /arbitrage.{0,20}(detected|found)/i.test(reason)\n} }];"
+      },
+      "id": "104cbd57-8cc9-44f7-8403-24ae622bf25e",
+      "name": "Parse + Delay Calc",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        400,
+        1760
+      ]
+    }
+  ],
+  "connections": {
+    "Build Log SQL": {
+      "main": [
+        [
+          {
+            "node": "DB: Log Messages + Update Thread2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Arbitrage SQL": {
+      "main": [
+        [
+          {
+            "node": "DB: Log Arbitrage + Handover2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Blooio Inbound Webhook1": {
+      "main": [
+        [
+          {
+            "node": "Extract Inbound2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Inbound2": {
+      "main": [
+        [
+          {
+            "node": "Is Real Message?2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Real Message?2": {
+      "main": [
+        [
+          {
+            "node": "DB: Lookup Contact + Thread2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DB: Lookup Contact + Thread2": {
+      "main": [
+        [
+          {
+            "node": "Load KB SharePoint2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load KB SharePoint2": {
+      "main": [
+        [
+          {
+            "node": "Load Calendar2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Calendar2": {
+      "main": [
+        [
+          {
+            "node": "Prepare Agent Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Conversation Memory2": {
+      "ai_memory": [
+        [
+          {
+            "node": "Fil AI Agent",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anthropic Chat Model2": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Fil AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Human Delay2": {
+      "main": [
+        [
+          {
+            "node": "Send Reply iMessage2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Reply iMessage2": {
+      "main": [
+        [
+          {
+            "node": "Build Log SQL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DB: Log Messages + Update Thread2": {
+      "main": [
+        [
+          {
+            "node": "Escalation?2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Escalation?2": {
+      "main": [
+        [
+          {
+            "node": "Email Escalation2",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Build Arbitrage SQL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fil AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Parse + Delay Calc",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Agent Input": {
+      "main": [
+        [
+          {
+            "node": "Fil AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse + Delay Calc": {
+      "main": [
+        [
+          {
+            "node": "Human Delay2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "1e67d85516f69f6b5d6a7605c605d484c7855249226b640fe8e43788668ce913"
+  }
+}

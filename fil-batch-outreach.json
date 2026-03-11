@@ -1,0 +1,312 @@
+{
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "b1000001-0001-0001-0001-000000000001",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -240,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT mt.id as thread_id, c.id as contact_id, c.full_name,\n       cp.phone_number, p.id as property_id, p.address, p.city, p.state,\n       p.property_type, l.list_price, l.listed_cap_rate,\n       mt.thread_type\nFROM app.message_threads mt\nJOIN app.contacts c ON c.id = mt.contact_id\nJOIN app.contact_phones cp ON cp.contact_id = c.id AND cp.is_primary = TRUE\nLEFT JOIN app.properties p ON p.id = mt.property_id\nLEFT JOIN app.listings l ON l.property_id = p.id\nWHERE mt.status = 'active'\n  AND mt.stage = 'open'\n  AND mt.touchpoint_count = 0\n  AND cp.phone_number IS NOT NULL\n  AND cp.phone_number != ''\nORDER BY mt.created_at ASC\nLIMIT 50",
+        "options": {}
+      },
+      "id": "2f50bd70-e98e-4a7d-93b5-d46db8b4b2f0",
+      "name": "DB: Get Pending Outreach",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        224,
+        1456
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_WITH_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst results = [];\n\nfor (const item of items) {\n  const d = item.json;\n  \n  // Skip if no data returned (empty query result)\n  if (!d.thread_id || !d.phone_number) continue;\n  \n  const firstName = (d.full_name || '').split(' ')[0] || 'there';\n  const address = d.address || '';\n  const city = d.city || '';\n  const state = d.state || '';\n  const location = city && state ? `${city}, ${state}` : city || state || '';\n\n  let message = '';\n  if (address && location) {\n    message = `Hey ${firstName}, this is Fil from Kumo Capital. I came across ${address} in ${location} and it caught my eye. Is it still available?`;\n  } else if (address) {\n    message = `Hey ${firstName}, this is Fil from Kumo Capital. I came across ${address} and it caught my eye. Is it still available?`;\n  } else {\n    message = `Hey ${firstName}, this is Fil from Kumo Capital. I saw one of your listings come across my desk and wanted to reach out. Got a minute?`;\n  }\n\n  results.push({\n    json: {\n      ...d,\n      message,\n      first_name: firstName\n    }\n  });\n}\n\nif (results.length === 0) {\n  return [{ json: { no_pending: true, message: 'No pending outreach found' } }];\n}\n\nreturn results;"
+      },
+      "id": "e821d167-bdb8-4e55-aef6-9c0841e7bbb0",
+      "name": "Prepare Batch Messages",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        448,
+        1456
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "has-pending",
+              "leftValue": "={{ $json.no_pending }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "notEquals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "1dfcb283-a806-47c5-8f85-8edcdd4c448f",
+      "name": "Has Pending?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        672,
+        1456
+      ]
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "4bd95920-7061-4ee4-b573-a044894b4eb3",
+      "name": "Loop Items",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        896,
+        1344
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://backend.blooio.com/v2/api/chats/{{ $json.phone_number }}/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: $json.message }) }}",
+        "options": {}
+      },
+      "id": "abb87cae-0e62-4880-8b98-b3d444cca3c3",
+      "name": "Send Batch iMessage",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1120,
+        1168
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "MEYcl3UDq2KUbdVC",
+          "name": "Header Auth account 3"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Log outbound message\nINSERT INTO app.messages (thread_id, direction, sender, body, sent_at)\nVALUES ($1::uuid, 'outbound'::message_direction, 'bot'::message_sender, $2, NOW());\n\n-- Update thread\nUPDATE app.message_threads\nSET touchpoint_count = touchpoint_count + 1,\n    stage = 'open',\n    last_outreach_at = NOW(),\n    next_followup_at = NOW() + INTERVAL '24 hours',\n    updated_at = NOW()\nWHERE id = $1::uuid;",
+        "options": {},
+        "queryParams": "={{ [$json.thread_id, $json.message] }}"
+      },
+      "id": "6c63d79f-b487-4cba-b2a2-a64b04c6ce71",
+      "name": "DB: Log + Update Thread",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1344,
+        1168
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_WITH_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {},
+      "id": "ebbf5990-bb35-4ab9-a339-22000076bf2e",
+      "name": "Wait 5s",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1568,
+        1264
+      ],
+      "webhookId": "a39430c5-6ea6-4f42-8512-6f729aecd9ec"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "batch-status",
+              "name": "status",
+              "value": "Batch outreach complete",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "7ef1c955-6baf-4fa9-9d23-d2d932424038",
+      "name": "Batch Done",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1120,
+        1360
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "no-pending-status",
+              "name": "status",
+              "value": "No pending outreach found",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "dfa61b0c-2c91-4e52-b163-ebbbdbd8a1c1",
+      "name": "No Pending",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        896,
+        1536
+      ]
+    }
+  ],
+  "connections": {
+    "DB: Get Pending Outreach": {
+      "main": [
+        [
+          {
+            "node": "Prepare Batch Messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Batch Messages": {
+      "main": [
+        [
+          {
+            "node": "Has Pending?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Pending?": {
+      "main": [
+        [
+          {
+            "node": "Loop Items",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No Pending",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Items": {
+      "main": [
+        [
+          {
+            "node": "Batch Done",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Batch iMessage",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Batch iMessage": {
+      "main": [
+        [
+          {
+            "node": "DB: Log + Update Thread",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DB: Log + Update Thread": {
+      "main": [
+        [
+          {
+            "node": "Wait 5s",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait 5s": {
+      "main": [
+        [
+          {
+            "node": "Loop Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "DB: Get Pending Outreach",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "1e67d85516f69f6b5d6a7605c605d484c7855249226b640fe8e43788668ce913"
+  }
+}
